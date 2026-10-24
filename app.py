@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 st.title("📋 Isolo Imbi Data Logger")
-st.caption("Cleans messy, busy chat dumps and 1,000+ unstandardized call log entries into standardized 4-column CSV format.")
+st.caption("Hii ni mambo bad. Unaweka data ya Teams inakupea excel safi.")
 
 # Standard default ignored keys per specification
 DEFAULT_IGNORED = [
