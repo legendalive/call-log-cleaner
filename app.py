@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
+import time
 from io import BytesIO
 
 # Try importing docx for .docx support
@@ -17,7 +18,7 @@ st.set_page_config(
 )
 
 st.title("📋 Isolo Imbi Data Logger")
-st.caption("Cleans messy, busy chat dumps and 1,000+ unstandardized call log entries into standardized 4-column CSV format.")
+st.caption("Cleans messy chat dumps and unstandardized call log entries into a standardized 4-column CSV format.")
 
 # Standard default ignored keys per specification
 DEFAULT_IGNORED = [
@@ -28,24 +29,30 @@ DEFAULT_IGNORED = [
     'employee code', 'emp code', 'agent id'
 ]
 
-# Initialize session state for batch management so Clear Batch works 100% reliably
+# Initialize session state so data and state persist cleanly across downloads and reruns
 if "batch_id" not in st.session_state:
     st.session_state["batch_id"] = 0
+if "processed_df" not in st.session_state:
+    st.session_state["processed_df"] = None
+if "stripped_count" not in st.session_state:
+    st.session_state["stripped_count"] = 0
 
 def clear_current_batch():
-    """Increments the batch_id to instantly reset both file uploader and text area."""
+    """Resets everything: uploaded file, text area, and parsed results."""
     st.session_state["batch_id"] += 1
+    st.session_state["processed_df"] = None
+    st.session_state["stripped_count"] = 0
 
 def strip_chat_noise(raw_text):
     """
-    Strips image data, chat media placeholders, and chat timestamps
-    to reduce memory by 90%+ and prevent crashes on large 1,000+ chat dumps.
+    Strips images, base64 strings, media tags, and chat timestamps
+    to reduce memory by 90%+ and prevent crashes on large 1,000+ entries.
     """
     if not raw_text:
         return "", 0
 
     text = raw_text
-    # 1. Strip base64 image data URIs
+    # 1. Strip base64 image strings
     text, b64_count = re.subn(r"data:image/[a-zA-Z0-9\+\-\.]+;base64,[A-Za-z0-9+/=]+", "", text)
     # 2. Strip chat image markers (<image omitted>, [photo], [sticker], etc.)
     img_pattern = r"(?:<image\s+omitted>|\[image(?::\s*[^\]]*)?\]|\[photo(?::\s*[^\]]*)?\]|\[sticker(?::\s*[^\]]*)?\]|\[attached:\s*[^\]]*\]|<attached:\s*[^>]*>|!\[.*?\]\(.*?\)|<img[^>]*>)"
@@ -125,7 +132,7 @@ def is_ignored(line):
             return True
     return False
 
-def parse_logs(text, time_mode="Preserve Original"):
+def parse_logs(text, time_mode="Preserve Original", progress_callback=None):
     cleaned_text, stripped_img_count = strip_chat_noise(text)
     lines = cleaned_text.split('\n')
     blocks, current_block = [], []
@@ -139,8 +146,10 @@ def parse_logs(text, time_mode="Preserve Original"):
     if any(l.strip() for l in current_block):
         blocks.append(current_block)
 
+    total_blocks = len(blocks)
     records = []
-    for block in blocks:
+
+    for idx, block in enumerate(blocks):
         name = ""
         issue_parts = []
         start_time = ""
@@ -190,13 +199,15 @@ def parse_logs(text, time_mode="Preserve Original"):
                 "END TIME": format_time(end_time, time_mode)
             })
 
-    # Return pure DataFrame with no row caps
+        if progress_callback and (idx % 25 == 0 or idx == total_blocks - 1):
+            progress_callback(idx + 1, total_blocks)
+
     return pd.DataFrame(records, columns=["NAME", "ISSUE", "Start time", "END TIME"]), stripped_img_count
 
-# Layout
-col1, col2 = st.columns([2, 1])
+# Layout: Options & Inputs
+col_left, col_right = st.columns([2, 1])
 
-with col2:
+with col_right:
     st.subheader("⚙️ Options")
     time_format = st.selectbox(
         "Time Standardization",
@@ -204,58 +215,96 @@ with col2:
         index=0,
         key=f"time_format_{st.session_state['batch_id']}"
     )
-    # Reliable Clear Batch Button via callback
+    
     st.button(
         "🗑️ Clear Batch",
         on_click=clear_current_batch,
         use_container_width=True,
-        help="Clears both uploaded files and pasted text to start a clean new batch"
+        help="Clears both uploaded files, pasted text, and table to start a clean new batch"
     )
 
-with col1:
-    st.subheader("📥 Input Raw Logs / Chat Dumps")
-    # Dynamic keys ensure widgets reset completely when Clear Batch is clicked
+with col_left:
+    st.subheader("📥 Input Data (File or Paste)")
+    
     uploaded = st.file_uploader(
-        "Upload .txt or .docx file",
-        type=["txt", "docx"],
+        "Upload a .docx, .doc, or .txt file",
+        type=["docx", "doc", "txt", "csv", "log"],
         key=f"uploader_{st.session_state['batch_id']}"
     )
     
-    file_text = ""
+    file_extracted_text = ""
     if uploaded is not None:
-        if uploaded.name.endswith(".docx"):
-            if HAS_DOCX:
-                doc = Document(BytesIO(uploaded.read()))
-                file_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-                st.success(f"Extracted pure text paragraphs from {uploaded.name} (images stripped)")
+        try:
+            if uploaded.name.lower().endswith(".docx"):
+                if HAS_DOCX:
+                    doc = Document(BytesIO(uploaded.read()))
+                    file_extracted_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                    st.success(f"✅ Successfully read `{uploaded.name}`. Images stripped. Click 'Process Batch' below.")
+                else:
+                    st.warning("⚠️ python-docx not installed. Please paste text directly.")
             else:
-                st.warning("python-docx not installed. Please paste text directly.")
-        else:
-            file_text = uploaded.read().decode("utf-8", errors="ignore")
+                file_extracted_text = uploaded.read().decode("utf-8", errors="ignore")
+                st.success(f"✅ Successfully read `{uploaded.name}`. Click 'Process Batch' below.")
+        except Exception as e:
+            st.error(f"Error reading uploaded file: {e}")
 
-    input_text = st.text_area(
-        "Or Paste Busy Chat Dump:",
-        value=file_text,
+    pasted_text = st.text_area(
+        "Or Paste Raw Log / Chat Text Here:",
+        value=file_extracted_text,
         key=f"textarea_{st.session_state['batch_id']}",
-        height=220,
-        placeholder="Paste your unformatted chat dump or call log batch here..."
+        height=180,
+        placeholder="Paste your unformatted chat dump or call log entries here..."
     )
 
-# Results Section
-if input_text and input_text.strip():
-    df, stripped_count = parse_logs(input_text, time_format)
-    
-    st.divider()
+# The content to process: either from the uploaded file or the text area
+content_to_process = pasted_text if pasted_text and pasted_text.strip() else file_extracted_text
 
-    # Prominent, compact Download Button placed UP above the data table
+# Prominent PROCESS Button requested by user
+st.markdown("---")
+process_btn_col1, process_btn_col2 = st.columns([1, 2])
+with process_btn_col1:
+    process_clicked = st.button(
+        "⚡ Process Batch",
+        type="primary",
+        disabled=not bool(content_to_process and content_to_process.strip()),
+        use_container_width=True,
+        help="Click to parse and clean the logs into the standardized CSV format"
+    )
+
+# When Process Button is clicked, run progress bar and save to session_state
+if process_clicked and content_to_process.strip():
+    progress_bar = st.progress(0, text="Starting parsing engine...")
+
+    def update_progress(current, total):
+        pct = min(1.0, current / max(1, total))
+        progress_bar.progress(pct, text=f"Processing {current:,} of {total:,} records ({int(pct*100)}%)...")
+
+    # Run parsing with progress updates
+    df, stripped_count = parse_logs(content_to_process, time_format, progress_callback=update_progress)
+    progress_bar.progress(1.0, text="Processing complete!")
+    time.sleep(0.3)
+    progress_bar.empty()
+
+    # Save to session_state so results and download button STAY VISIBLE even after clicking download!
+    st.session_state["processed_df"] = df
+    st.session_state["stripped_count"] = stripped_count
+
+# Results Section: Display processed data and prominent Download Report button
+if st.session_state.get("processed_df") is not None and not st.session_state["processed_df"].empty:
+    df = st.session_state["processed_df"]
+    stripped_count = st.session_state.get("stripped_count", 0)
+
+    st.markdown("### 📊 Cleaned & Standardized Results")
+    
+    # Prominent, compact Download Button moved UP above the data table
     header_col, action_col = st.columns([3, 1])
     csv_data = df.to_csv(index=False).encode('utf-8')
-    
+
     with header_col:
-        st.subheader(f"✅ Cleaned Data ({len(df):,} records)")
+        st.write(f"**Total Records:** `{len(df):,}` rows (No caps)")
         if stripped_count > 0:
-            st.caption(f"⚡ Automatically stripped {stripped_count} image/media tags to optimize memory.")
-            
+            st.caption(f"⚡ Automatically stripped {stripped_count} image/media tags to protect memory.")
+
     with action_col:
         st.download_button(
             label="📥 Download Report",
@@ -267,5 +316,7 @@ if input_text and input_text.strip():
             help="Download the standardized 4-column CSV report"
         )
 
-    # Editable data preview
+    # Editable Data Preview Table
     edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+elif st.session_state.get("processed_df") is not None and st.session_state["processed_df"].empty:
+    st.warning("No records could be extracted. Please ensure the entries contain lines like 'Name: ...'.")
