@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 st.title("📋 Isolo Imbi Data Logger")
-st.caption("Hii ni mambo bad. Unaweka data ya Teams inakupea excel safi.")
+st.caption("Cleans messy, busy chat dumps and 1,000+ unstandardized call log entries into standardized 4-column CSV format.")
 
 # Standard default ignored keys per specification
 DEFAULT_IGNORED = [
@@ -27,6 +27,14 @@ DEFAULT_IGNORED = [
     'dcst', 'ccik',
     'employee code', 'emp code', 'agent id'
 ]
+
+# Initialize session state for batch management so Clear Batch works 100% reliably
+if "batch_id" not in st.session_state:
+    st.session_state["batch_id"] = 0
+
+def clear_current_batch():
+    """Increments the batch_id to instantly reset both file uploader and text area."""
+    st.session_state["batch_id"] += 1
 
 def strip_chat_noise(raw_text):
     """
@@ -182,6 +190,7 @@ def parse_logs(text, time_mode="Preserve Original"):
                 "END TIME": format_time(end_time, time_mode)
             })
 
+    # Return pure DataFrame with no row caps
     return pd.DataFrame(records, columns=["NAME", "ISSUE", "Start time", "END TIME"]), stripped_img_count
 
 # Layout
@@ -192,15 +201,25 @@ with col2:
     time_format = st.selectbox(
         "Time Standardization",
         ["Preserve Original", "12-Hour (HH:MM:SS AM/PM)", "24-Hour (HH:MM:SS)"],
-        index=0
+        index=0,
+        key=f"time_format_{st.session_state['batch_id']}"
     )
-    if st.button("🗑️ Clear Batch", use_container_width=True):
-        st.session_state["raw_input"] = ""
-        st.rerun()
+    # Reliable Clear Batch Button via callback
+    st.button(
+        "🗑️ Clear Batch",
+        on_click=clear_current_batch,
+        use_container_width=True,
+        help="Clears both uploaded files and pasted text to start a clean new batch"
+    )
 
 with col1:
     st.subheader("📥 Input Raw Logs / Chat Dumps")
-    uploaded = st.file_uploader("Upload .txt or .docx file", type=["txt", "docx"])
+    # Dynamic keys ensure widgets reset completely when Clear Batch is clicked
+    uploaded = st.file_uploader(
+        "Upload .txt or .docx file",
+        type=["txt", "docx"],
+        key=f"uploader_{st.session_state['batch_id']}"
+    )
     
     file_text = ""
     if uploaded is not None:
@@ -216,25 +235,37 @@ with col1:
 
     input_text = st.text_area(
         "Or Paste Busy Chat Dump:",
-        value=file_text or st.session_state.get("raw_input", ""),
+        value=file_text,
+        key=f"textarea_{st.session_state['batch_id']}",
         height=220,
         placeholder="Paste your unformatted chat dump or call log batch here..."
     )
 
-if input_text.strip():
+# Results Section
+if input_text and input_text.strip():
     df, stripped_count = parse_logs(input_text, time_format)
-    st.subheader(f"✅ Cleaned Data ({len(df):,} records)")
-    if stripped_count > 0:
-        st.info(f"Stripped {stripped_count} image/media tags to save memory.")
+    
+    st.divider()
 
+    # Prominent, compact Download Button placed UP above the data table
+    header_col, action_col = st.columns([3, 1])
+    csv_data = df.to_csv(index=False).encode('utf-8')
+    
+    with header_col:
+        st.subheader(f"✅ Cleaned Data ({len(df):,} records)")
+        if stripped_count > 0:
+            st.caption(f"⚡ Automatically stripped {stripped_count} image/media tags to optimize memory.")
+            
+    with action_col:
+        st.download_button(
+            label="📥 Download Report",
+            data=csv_data,
+            file_name="isolo_imbi_call_logs.csv",
+            mime="text/csv",
+            type="primary",
+            use_container_width=False,
+            help="Download the standardized 4-column CSV report"
+        )
+
+    # Editable data preview
     edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
-
-    csv_data = edited_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label=f"📥 Download Standardized CSV ({len(df):,} rows)",
-        data=csv_data,
-        file_name="isolo_imbi_call_logs.csv",
-        mime="text/csv",
-        type="primary",
-        use_container_width=True
-    )
